@@ -154,10 +154,16 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
     @app.before_request
     def identity_and_csrf():
         g.account=None
-        g.public_preview=request.endpoint=="index" and request.args.get("view")=="public"
+        g.public_preview=False
         account=db().execute("SELECT * FROM accounts WHERE id=? AND active=1",(session.get("love_uid"),)).fetchone()
-        if account and hmac.compare_digest(stamp(account),str(session.get("love_stamp",""))):
+        if account and account["role"]=="admin" and hmac.compare_digest(stamp(account),str(session.get("love_stamp",""))):
             g.account=account
+        if request.endpoint is None:
+            abort(404)
+        if request.endpoint not in {'static','login','logout'} and not g.account:
+            if request.endpoint=='media' or request.method!='GET':
+                abort(404)
+            return redirect(url_for('login'))
         if request.method in {"POST","PUT","PATCH","DELETE"}:
             supplied=request.headers.get("X-CSRF-Token") or request.form.get("_csrf","")
             if not session.get("csrf") or not hmac.compare_digest(session["csrf"],supplied):
@@ -178,6 +184,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
         return decorate
 
     def profile():
+        if not g.account: return {}
         values={r["key"]:r["value"] for r in db().execute("SELECT * FROM settings")}
         # Never place private profile values in a visitor's rendered HTML.
         if (not g.account or g.public_preview) and values.get("public_profile")!="1":
@@ -235,7 +242,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
                 raise LoveError("用户名或密码不正确。")
             account=db().execute("SELECT * FROM accounts WHERE username=? AND active=1",(name,)).fetchone()
             valid=check_password_hash(account["password_hash"] if account else dummy,password)
-            if account and valid:
+            if account and valid and account["role"]=="admin":
                 session.clear();session.permanent=True
                 session.update(love_uid=account["id"],love_stamp=stamp(account))
                 return redirect(url_for("index"))
@@ -247,37 +254,8 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
         session.clear()
         return redirect(url_for("index"))
 
-    @app.route("/join",methods=["GET","POST"])
-    def join():
-        if g.account:
-            return redirect(url_for("index"))
-        if request.method=="POST":
-            reserve("join:"+(request.remote_addr or "unknown"),5,3600)
-            name,password=request.form.get("username",""),request.form.get("password","")
-            credentials(name,password)
-            if password!=request.form.get("confirm",""):
-                raise LoveError("两次输入的密码不同。")
-            code=request.form.get("invite","").strip()
-            if len(code)>100:
-                raise LoveError("邀请已失效，请向管理员索取新的邀请。")
-            digest=hashlib.sha256(code.encode()).hexdigest()
-            password_hash=generate_password_hash(password)
-            try:
-                with db():
-                    db().execute("BEGIN IMMEDIATE")
-                    invite=db().execute("SELECT * FROM invitations WHERE digest=? AND used=0 AND expires>?",(digest,time.time())).fetchone()
-                    if not invite or db().execute("SELECT 1 FROM accounts WHERE role='partner' AND active=1").fetchone():
-                        raise LoveError("邀请已失效，或伴侣账号已经加入。")
-                    db().execute("INSERT INTO accounts(username,password_hash,role) VALUES(?,?,'partner')",(name,password_hash))
-                    db().execute("UPDATE invitations SET used=1 WHERE digest=?",(digest,))
-            except sqlite3.IntegrityError:
-                raise LoveError("这个用户名已经使用，请换一个。")
-            flash("已经加入这颗星，登录后就能一起记录。")
-            return redirect(url_for("login"))
-        return render_template("love_auth.html",joining=True)
-
     def visible_where():
-        return "deleted_at IS NULL" + ("" if g.account and not g.public_preview else " AND public=1")
+        return "deleted_at IS NULL"
 
     @app.get("/")
     def index():
@@ -367,9 +345,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
                 raise LoveError("标题 1–100 字，正文 1–10000 字，请选择有效的心情。")
             if not row and db().execute("SELECT COUNT(*) FROM moments").fetchone()[0]>=1000:
                 raise LoveError("记录已达到 1000 条，请先备份整理。")
-            public=int(request.form.get("public")=="1")
-            if public and request.form.get("confirm_public")!="1":
-                raise LoveError("公开内容会被所有访客看到，请勾选公开确认。")
+            public=0
             photo=store_photo(request.files.get("photo")) or (row["photo"] if row else "")
             if request.form.get("remove_photo")=="1" and not request.files.get("photo"):
                 photo=""
@@ -430,9 +406,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
                 raise LoveError("纪念日名称请控制在 1–80 个字。")
             if not editing and db().execute("SELECT COUNT(*) FROM anniversaries").fetchone()[0]>=100:
                 raise LoveError("最多保留 100 个纪念日。")
-            public=int(request.form.get("public")=="1")
-            if public and request.form.get("confirm_public")!="1":
-                raise LoveError("公开纪念日需要勾选确认。")
+            public=0
             with db():
                 if editing:
                     db().execute("UPDATE anniversaries SET title=?,day=?,yearly=?,public=? WHERE id=?",(title,day,int(request.form.get("yearly")=="1"),public,item_id))
@@ -495,7 +469,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
             if assignee:
                 if not assignee.isascii() or not assignee.isdigit() or len(assignee)>10:
                     raise LoveError('请选择有效的负责人。')
-                target=db().execute('SELECT id FROM accounts WHERE id=? AND active=1',(int(assignee),)).fetchone()
+                target=db().execute('SELECT id FROM accounts WHERE id=? AND active=1 AND role="admin"',(int(assignee),)).fetchone()
                 if not target: raise LoveError('这个账号当前不可分配待办。')
                 target=target['id']
             with db():
@@ -512,7 +486,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
         where=clauses.get(selected,clauses['open']);params=[today().isoformat()] if selected=='today' else []
         if project: where+=' AND project=?';params.append(project)
         rows=db().execute('SELECT t.*,a.username AS assignee FROM todos t LEFT JOIN accounts a ON a.id=t.assignee_id WHERE '+where+" ORDER BY priority DESC,CASE WHEN due='' THEN 1 ELSE 0 END,due,id DESC",params).fetchall()
-        people=db().execute('SELECT id,username FROM accounts WHERE active=1').fetchall()
+        people=db().execute("SELECT id,username FROM accounts WHERE active=1 AND role='admin'").fetchall()
         projects=[r[0] for r in db().execute('SELECT DISTINCT project FROM todos WHERE archived=0 ORDER BY project')]
         return render_template('love_todos.html',tasks=rows,editing=editing,people=people,projects=projects,selected=selected,project=project)
 
@@ -537,44 +511,12 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
                 raise LoveError("昵称最多 20 个字。")
             if values["start_day"] and valid_day(values["start_day"])>today():
                 raise LoveError("在一起的第一天不能晚于今天。")
-            values["public_profile"]="1" if request.form.get("public_profile")=="1" else "0"
+            values["public_profile"]="0"
             with db():
                 db().executemany("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",values.items())
             flash("星球设置已保存。")
             return redirect(url_for("settings"))
-        partner=db().execute("SELECT id,username,active FROM accounts WHERE role='partner' ORDER BY id DESC").fetchall()
-        return render_template("love_settings.html",partners=partner,invite=None)
-
-    @app.post("/invite")
-    @member_only(admin=True)
-    def invite():
-        code=secrets.token_urlsafe(24)
-        with db():
-            db().execute("BEGIN IMMEDIATE")
-            if db().execute("SELECT 1 FROM accounts WHERE role='partner' AND active=1").fetchone():
-                raise LoveError("伴侣账号已经加入，无需重复邀请。")
-            db().execute("UPDATE invitations SET used=1 WHERE used=0")
-            db().execute("INSERT INTO invitations VALUES(?,?,0)",(hashlib.sha256(code.encode()).hexdigest(),time.time()+86400))
-        return render_template("love_settings.html",partners=db().execute("SELECT id,username,active FROM accounts WHERE role='partner' ORDER BY id DESC").fetchall(),invite=code)
-
-    @app.post("/partners/<int:partner_id>/disable")
-    @member_only(admin=True)
-    def disable_partner(partner_id):
-        with db():
-            db().execute("UPDATE accounts SET active=0,version=version+1 WHERE id=? AND role='partner'",(partner_id,))
-        flash("伴侣账号已停用，已有登录会话也已失效。记录仍保留。")
-        return redirect(url_for("settings"))
-
-    @app.post("/partners/<int:partner_id>/enable")
-    @member_only(admin=True)
-    def enable_partner(partner_id):
-        with db():
-            db().execute("BEGIN IMMEDIATE")
-            if db().execute("SELECT 1 FROM accounts WHERE role='partner' AND active=1 AND id<>?",(partner_id,)).fetchone():
-                raise LoveError("已经有一个启用的伴侣账号，请先停用后再调整。")
-            db().execute("UPDATE accounts SET active=1,version=version+1 WHERE id=? AND role='partner'",(partner_id,))
-        flash("伴侣账号已重新启用，TA 可以使用原账号重新登录。")
-        return redirect(url_for("settings"))
+        return render_template("love_settings.html")
 
     with app.app_context():
         db().execute("PRAGMA journal_mode=WAL")
