@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS anniversaries (
 CREATE TABLE IF NOT EXISTS wishes (
  id INTEGER PRIMARY KEY,author_id INTEGER NOT NULL REFERENCES accounts(id),
  title TEXT NOT NULL,done INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS todos (
+ id INTEGER PRIMARY KEY,author_id INTEGER NOT NULL REFERENCES accounts(id),
+ title TEXT NOT NULL,notes TEXT NOT NULL DEFAULT '',project TEXT NOT NULL DEFAULT '日常',
+ due TEXT NOT NULL DEFAULT '',priority INTEGER NOT NULL DEFAULT 0,assignee_id INTEGER REFERENCES accounts(id),
+ done INTEGER NOT NULL DEFAULT 0,archived INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
 """
 USERNAME = re.compile(r"[A-Za-z0-9_一-鿿.-]{1,10}\Z")
 MOODS = {"heart":"心动", "daily":"小日常", "date":"约会", "travel":"出走一下", "gift":"小惊喜", "rain":"一起撑伞"}
@@ -295,8 +300,12 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
             milestone=dict(target=target,left=target-days,date=(start+dt.timedelta(days=target-1)).isoformat())
         upcoming=[{**dict(row),**countdown(row["day"],row["yearly"])} for row in db().execute("SELECT * FROM anniversaries"+("" if g.account and not g.public_preview else " WHERE public=1"))]
         upcoming.sort(key=lambda item:(item["days"]<0,abs(item["days"])))
+        tasks=[]; task_count=0
+        if g.account and not g.public_preview:
+            tasks=db().execute("SELECT * FROM todos WHERE done=0 AND archived=0 ORDER BY CASE WHEN due='' THEN 1 ELSE 0 END,due,priority DESC,id DESC LIMIT 3").fetchall()
+            task_count=db().execute('SELECT COUNT(*) FROM todos WHERE done=0 AND archived=0').fetchone()[0]
         return render_template("love_index.html",moments=moments,count=count,page=page,pages=max(1,(count+11)//12),query=query,
-                               on_this_day=on_this_day,days=days,milestone=milestone,upcoming=upcoming[:2])
+                               on_this_day=on_this_day,days=days,milestone=milestone,upcoming=upcoming[:2],tasks=tasks,task_count=task_count)
 
     def moment(book_id,editing=False,deleted=False):
         row=db().execute("SELECT m.*,a.username FROM moments m JOIN accounts a ON a.id=m.author_id WHERE m.id=?",(book_id,)).fetchone()
@@ -465,6 +474,59 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
         with db():
             db().execute("UPDATE wishes SET done=1-done,updated_at=? WHERE id=?",(dt.datetime.now(dt.timezone.utc).isoformat(),item_id))
         return redirect(url_for("wishes"))
+
+    @app.route('/todos',methods=['GET','POST'])
+    @app.route('/todos/<int:item_id>/edit',methods=['GET','POST'])
+    @member_only()
+    def todos(item_id=None):
+        editing=None
+        if item_id:
+            editing=db().execute('SELECT * FROM todos WHERE id=?',(item_id,)).fetchone()
+            if not editing or (g.account['role']!='admin' and editing['author_id']!=g.account['id']):
+                abort(403)
+        if request.method=='POST':
+            title=request.form.get('title','').strip();notes=request.form.get('notes','').strip()
+            project=request.form.get('project','日常').strip() or '日常';due=request.form.get('due','').strip()
+            priority=request.form.get('priority','0');assignee=request.form.get('assignee','')
+            if not 1<=len(title)<=150 or len(notes)>2000 or len(project)>30 or priority not in ('0','1'):
+                raise LoveError('待办名称 1–150 字，备注最多 2000 字，项目名最多 30 字。')
+            if due: due=valid_day(due).isoformat()
+            target=None
+            if assignee:
+                if not assignee.isascii() or not assignee.isdigit() or len(assignee)>10:
+                    raise LoveError('请选择有效的负责人。')
+                target=db().execute('SELECT id FROM accounts WHERE id=? AND active=1',(int(assignee),)).fetchone()
+                if not target: raise LoveError('这个账号当前不可分配待办。')
+                target=target['id']
+            with db():
+                if not editing and db().execute('SELECT COUNT(*) FROM todos WHERE archived=0').fetchone()[0]>=500:
+                    raise LoveError('最多保留 500 项待办，请先归档已完成的项目。')
+                values=(title,notes,project,due,int(priority),target,dt.datetime.now(dt.timezone.utc).isoformat())
+                if editing:
+                    db().execute('UPDATE todos SET title=?,notes=?,project=?,due=?,priority=?,assignee_id=?,updated_at=? WHERE id=?',(*values,item_id))
+                else:
+                    db().execute('INSERT INTO todos(title,notes,project,due,priority,assignee_id,updated_at,author_id) VALUES(?,?,?,?,?,?,?,?)',(*values,g.account['id']))
+            return redirect(url_for('todos'))
+        selected=request.args.get('filter','open');project=request.args.get('project','')[:30]
+        clauses={'open':'t.done=0 AND archived=0','today':"t.done=0 AND archived=0 AND due<>'' AND due<=?",'done':'t.done=1 AND archived=0','archive':'archived=1'}
+        where=clauses.get(selected,clauses['open']);params=[today().isoformat()] if selected=='today' else []
+        if project: where+=' AND project=?';params.append(project)
+        rows=db().execute('SELECT t.*,a.username AS assignee FROM todos t LEFT JOIN accounts a ON a.id=t.assignee_id WHERE '+where+" ORDER BY priority DESC,CASE WHEN due='' THEN 1 ELSE 0 END,due,id DESC",params).fetchall()
+        people=db().execute('SELECT id,username FROM accounts WHERE active=1').fetchall()
+        projects=[r[0] for r in db().execute('SELECT DISTINCT project FROM todos WHERE archived=0 ORDER BY project')]
+        return render_template('love_todos.html',tasks=rows,editing=editing,people=people,projects=projects,selected=selected,project=project)
+
+    @app.post('/todos/<int:item_id>/<action>')
+    @member_only()
+    def todo_action(item_id,action):
+        row=db().execute('SELECT * FROM todos WHERE id=?',(item_id,)).fetchone()
+        if not row: abort(404)
+        if action not in ('toggle','archive','restore'): abort(404)
+        if action!='toggle' and g.account['role']!='admin' and row['author_id']!=g.account['id']: abort(403)
+        with db():
+            if action=='toggle': db().execute('UPDATE todos SET done=1-done,updated_at=? WHERE id=?',(dt.datetime.now(dt.timezone.utc).isoformat(),item_id))
+            else: db().execute('UPDATE todos SET archived=? WHERE id=?',(int(action=='archive'),item_id))
+        return redirect(url_for('todos',filter='archive' if action=='restore' else 'open'))
 
     @app.route("/settings",methods=["GET","POST"])
     @member_only(admin=True)

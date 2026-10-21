@@ -209,8 +209,29 @@ class LoveStarTests(unittest.TestCase):
     def test_every_screen_renders(self):
         self.memory()
         self.post(self.owner,"/anniversaries",dict(title="One time",day="2020-01-01"))
-        for path in ("/","/anniversaries","/wishes","/settings","/trash","/write","/moments/1","/moments/1/edit"):
+        for path in ("/","/anniversaries","/wishes","/todos","/settings","/trash","/write","/moments/1","/moments/1/edit"):
             self.assertEqual(self.owner.get(path).status_code,200,path)
+
+    def test_todos_assign_filter_complete_archive_and_stay_private(self):
+        self.join()
+        with self.app.app_context():
+            partner_id=self.app.extensions['love_db']().execute("SELECT id FROM accounts WHERE role='partner'").fetchone()[0]
+        response=self.post(self.owner,'/todos',{'title':'私密野餐准备','project':'周末计划','notes':'准备野餐垫','due':'2025-01-01','priority':'1','assignee':str(partner_id)})
+        self.assertEqual(response.status_code,302,response.data)
+        self.assertIn('私密野餐准备',self.partner.get('/todos?filter=today').get_data(as_text=True))
+        self.assertNotIn('私密野餐准备',self.visitor.get('/').get_data(as_text=True))
+        self.assertNotIn('私密野餐准备',self.owner.get('/?view=public').get_data(as_text=True))
+        self.assertEqual(self.visitor.get('/todos').status_code,302)
+        self.assertEqual(self.partner.get('/todos/1/edit').status_code,403)
+        self.post(self.partner,'/todos/1/toggle')
+        self.assertIn('私密野餐准备',self.owner.get('/todos?filter=done').get_data(as_text=True))
+        self.assertEqual(self.post(self.partner,'/todos/1/archive').status_code,403)
+        self.post(self.owner,'/todos/1/archive')
+        self.assertIn('私密野餐准备',self.owner.get('/todos?filter=archive').get_data(as_text=True))
+        self.post(self.owner,'/todos/1/restore')
+        self.assertEqual(self.owner.get('/todos/1/edit').status_code,200)
+        bad=self.post(self.owner,'/todos',{'title':'bad','assignee':'9999'})
+        self.assertEqual(bad.status_code,400)
 
 
 class CountdownTests(unittest.TestCase):
