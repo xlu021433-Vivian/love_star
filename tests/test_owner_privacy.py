@@ -23,6 +23,29 @@ class OwnerPrivacyTests(unittest.TestCase):
         with client.session_transaction() as session:token=session.get('csrf')
         return client.post(path,data={'_csrf':token,**(data or {})})
 
+    def test_todo_filters_survive_actions_and_include_archived_projects(self):
+        from urllib.parse import urlsplit, parse_qs
+        self.post(self.owner,'/todos',{'title':'旅行计划','project':'只在归档里'})
+        self.post(self.owner,'/todos',{'title':'另一个项目','project':'日常'})
+        result=self.post(self.owner,'/todos/1/archive',{'filter':'open','project':'只在归档里'})
+        self.assertEqual(parse_qs(urlsplit(result.location).query),{'filter':['open'],'project':['只在归档里']})
+        page=self.owner.get('/todos?filter=archive&project=只在归档里').get_data(as_text=True)
+        self.assertIn('旅行计划',page)
+        self.assertIn('<option selected>只在归档里</option>',page)
+        self.assertNotIn('另一个项目</h2>',page)
+        self.assertIn('已归档 <span class="todo-tab-count">1</span>',page)
+        self.assertIn('进行中 <span class="todo-tab-count">0</span>',page)
+        result=self.post(self.owner,'/todos/1/restore',{'filter':'archive','project':'只在归档里'})
+        self.assertEqual(parse_qs(urlsplit(result.location).query)['filter'],['archive'])
+        page=self.owner.get('/todos?filter=archive&project=只在归档里').get_data(as_text=True)
+        self.assertNotIn('旅行计划</h2>',page)
+        self.assertIn('当前项目下没有匹配的待办',page)
+        result=self.post(self.owner,'/todos/1/toggle',{'filter':'https://example.com','project':'只在归档里'})
+        self.assertEqual(urlsplit(result.location).netloc,'')
+        self.assertEqual(parse_qs(urlsplit(result.location).query)['filter'],['open'])
+        self.assertIn('进行中',self.owner.get('/todos?filter=unknown').get_data(as_text=True))
+        self.assertEqual(self.visitor.get('/todos?filter=archive').status_code,302)
+
     def test_legacy_public_records_photos_profile_and_anniversaries_are_closed(self):
         with self.app.app_context():
             db=self.app.extensions['love_db']()

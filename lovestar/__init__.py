@@ -449,6 +449,11 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
             db().execute("UPDATE wishes SET done=1-done,updated_at=? WHERE id=?",(dt.datetime.now(dt.timezone.utc).isoformat(),item_id))
         return redirect(url_for("wishes"))
 
+    def todo_view(values):
+        selected=values.get('filter','open')
+        return {'filter':selected if selected in ('open','today','done','archive') else 'open',
+                'project':values.get('project','')[:30]}
+
     @app.route('/todos',methods=['GET','POST'])
     @app.route('/todos/<int:item_id>/edit',methods=['GET','POST'])
     @member_only()
@@ -480,15 +485,16 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
                     db().execute('UPDATE todos SET title=?,notes=?,project=?,due=?,priority=?,assignee_id=?,updated_at=? WHERE id=?',(*values,item_id))
                 else:
                     db().execute('INSERT INTO todos(title,notes,project,due,priority,assignee_id,updated_at,author_id) VALUES(?,?,?,?,?,?,?,?)',(*values,g.account['id']))
-            return redirect(url_for('todos'))
-        selected=request.args.get('filter','open');project=request.args.get('project','')[:30]
+            return redirect(url_for('todos',**todo_view(request.args)))
+        state=todo_view(request.args);selected=state['filter'];project=state['project']
         clauses={'open':'t.done=0 AND archived=0','today':"t.done=0 AND archived=0 AND due<>'' AND due<=?",'done':'t.done=1 AND archived=0','archive':'archived=1'}
         where=clauses.get(selected,clauses['open']);params=[today().isoformat()] if selected=='today' else []
         if project: where+=' AND project=?';params.append(project)
         rows=db().execute('SELECT t.*,a.username AS assignee FROM todos t LEFT JOIN accounts a ON a.id=t.assignee_id WHERE '+where+" ORDER BY priority DESC,CASE WHEN due='' THEN 1 ELSE 0 END,due,id DESC",params).fetchall()
         people=db().execute("SELECT id,username FROM accounts WHERE active=1 AND role='admin'").fetchall()
-        projects=[r[0] for r in db().execute('SELECT DISTINCT project FROM todos WHERE archived=0 ORDER BY project')]
-        return render_template('love_todos.html',tasks=rows,editing=editing,people=people,projects=projects,selected=selected,project=project)
+        projects=[r[0] for r in db().execute('SELECT DISTINCT project FROM todos ORDER BY project')]
+        totals=db().execute("SELECT COALESCE(SUM(done=0 AND archived=0),0) AS open, COALESCE(SUM(done=0 AND archived=0 AND due<>'' AND due<=?),0) AS today, COALESCE(SUM(done=1 AND archived=0),0) AS done, COALESCE(SUM(archived=1),0) AS archive FROM todos"+(' WHERE project=?' if project else ''),[today().isoformat()]+([project] if project else [])).fetchone()
+        return render_template('love_todos.html',tasks=rows,editing=editing,people=people,projects=projects,selected=selected,project=project,totals=totals)
 
     @app.post('/todos/<int:item_id>/<action>')
     @member_only()
@@ -500,7 +506,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
         with db():
             if action=='toggle': db().execute('UPDATE todos SET done=1-done,updated_at=? WHERE id=?',(dt.datetime.now(dt.timezone.utc).isoformat(),item_id))
             else: db().execute('UPDATE todos SET archived=? WHERE id=?',(int(action=='archive'),item_id))
-        return redirect(url_for('todos',filter='archive' if action=='restore' else 'open'))
+        return redirect(url_for('todos',**todo_view(request.form)))
 
     @app.route("/settings",methods=["GET","POST"])
     @member_only(admin=True)
