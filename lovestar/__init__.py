@@ -1,4 +1,4 @@
-"""A single couple's private journal, with deliberately public memories."""
+"""An owner-only private journal with isolated data and optional host sign-in."""
 from contextlib import closing
 import datetime as dt
 import functools
@@ -115,6 +115,11 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
         SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=(os.environ.get("LOVE_HTTPS")=="1") if secure is None else secure,
         PERMANENT_SESSION_LIFETIME=dt.timedelta(days=14))
+    asset_versions={file.name:hashlib.sha256(file.read_bytes()).hexdigest()[:12] for file in (Path(app.root_path)/'static').iterdir() if file.suffix in {'.css','.js'}}
+    @app.url_defaults
+    def asset_version(endpoint,values):
+        if endpoint=='static' and values.get('filename') in asset_versions:
+            values.setdefault('v',asset_versions[values['filename']])
     dummy = generate_password_hash(secrets.token_urlsafe(24))
 
     def db():
@@ -151,13 +156,52 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
             session["csrf"]=secrets.token_urlsafe(32)
         return session["csrf"]
 
+    def host_account(identity):
+        owner_id=str(identity.get('id',''))
+        if not owner_id.isascii() or not owner_id.isdigit() or not 0<int(owner_id)<2**63:
+            abort(403)
+        conn=db()
+        binding=conn.execute("SELECT value FROM settings WHERE key='host_owner_id'").fetchone()
+        owner=conn.execute("SELECT * FROM accounts WHERE role='admin'").fetchone()
+        if binding and binding['value']!=owner_id:
+            abort(403)
+        if owner and not owner['active']:
+            abort(403)
+        if not binding or not owner:
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                binding=conn.execute("SELECT value FROM settings WHERE key='host_owner_id'").fetchone()
+                if binding and binding['value']!=owner_id:
+                    abort(403)
+                owner=conn.execute("SELECT * FROM accounts WHERE role='admin'").fetchone()
+                if not owner:
+                    name=str(identity.get('username','L5'))
+                    name=name if USERNAME.fullmatch(name) else 'L5'
+                    if conn.execute('SELECT 1 FROM accounts WHERE username=?',(name,)).fetchone():
+                        name='L5_'+secrets.token_hex(3)
+                    # No host password is copied or stored. Password login is disabled in host mode.
+                    conn.execute("INSERT INTO accounts(username,password_hash,role) VALUES(?,?,'admin')",(name,generate_password_hash(secrets.token_urlsafe(32))))
+                conn.execute("INSERT INTO settings(key,value) VALUES('host_owner_id',?) ON CONFLICT(key) DO NOTHING",(owner_id,))
+            owner=conn.execute("SELECT * FROM accounts WHERE role='admin'").fetchone()
+        if not owner['active']:
+            abort(403)
+        return owner
+
     @app.before_request
     def identity_and_csrf():
         g.account=None
         g.public_preview=False
-        account=db().execute("SELECT * FROM accounts WHERE id=? AND active=1",(session.get("love_uid"),)).fetchone()
-        if account and account["role"]=="admin" and hmac.compare_digest(stamp(account),str(session.get("love_stamp",""))):
-            g.account=account
+        if app.config.get('LOVE_HOST_LOGIN_URL'):
+            identity=request.environ.get('lovestar.host_owner')
+            if identity is not None:
+                g.account=host_account(identity)
+                if session.get('host_owner')!=str(identity['id']):
+                    session.clear();session.permanent=True;session['host_owner']=str(identity['id'])
+            # A private cookie alone never authorizes access after the host owner logs out.
+        else:
+            account=db().execute("SELECT * FROM accounts WHERE id=? AND active=1",(session.get("love_uid"),)).fetchone()
+            if account and account["role"]=="admin" and hmac.compare_digest(stamp(account),str(session.get("love_stamp",""))):
+                g.account=account
         if request.endpoint is None:
             abort(404)
         if request.endpoint not in {'static','login','logout'} and not g.account:
@@ -195,7 +239,8 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
     def context():
         csrf_token()
         return dict(account=g.account,public_preview=g.public_preview,csrf_token=csrf_token,profile=profile(),moods=MOODS,today=today().isoformat(),
-                    configured=bool(db().execute("SELECT 1 FROM accounts WHERE role='admin'").fetchone()))
+                    configured=bool(db().execute("SELECT 1 FROM accounts WHERE role='admin'").fetchone()),
+                    host_login_url=app.config.get('LOVE_HOST_LOGIN_URL'))
 
     @app.after_request
     def headers(response):
@@ -210,6 +255,14 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
 
     @app.errorhandler(LoveError)
     def invalid(error):
+        if g.account and request.method=='POST':
+            if request.endpoint=='write':
+                row=moment(request.view_args['moment_id'],editing=True) if request.view_args.get('moment_id') else None
+                return render_template('love_write.html',moment=row,form_error=str(error)),400
+            if request.endpoint=='todos':
+                item_id=request.view_args.get('item_id')
+                row=db().execute('SELECT * FROM todos WHERE id=?',(item_id,)).fetchone() if item_id else None
+                return render_todos(row,form_error=str(error)),400
         return render_template("love_error.html",code=400,message=str(error)),400
 
     for status in (400,403,404,413,429):
@@ -235,6 +288,10 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
     def login():
         if g.account:
             return redirect(url_for("index"))
+        if app.config.get('LOVE_HOST_LOGIN_URL'):
+            if request.method=='POST':
+                abort(405)
+            return render_template('love_host_auth.html')
         if request.method=="POST":
             name,password=request.form.get("username",""),request.form.get("password","")
             reserve("login-ip:"+(request.remote_addr or "unknown"),10,300)
@@ -252,7 +309,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
     @app.post("/logout")
     def logout():
         session.clear()
-        return redirect(url_for("index"))
+        return redirect('/' if app.config.get('LOVE_HOST_LOGIN_URL') else url_for("index"))
 
     def visible_where():
         return "deleted_at IS NULL"
@@ -274,7 +331,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
         days=None; milestone=None; values=profile()
         if values.get("start_day"):
             start=valid_day(values["start_day"]);days=max(1,(today()-start).days+1)
-            target=next((n for n in (100,365,520,730,1000,1314,2000,3000,5000,10000) if n>days),((days//1000)+1)*1000)
+            target=next((n for n in (100,365,520,730,1000,1314,2000,3000,5000,10000) if n>=days),((days//1000)+1)*1000)
             milestone=dict(target=target,left=target-days,date=(start+dt.timedelta(days=target-1)).isoformat())
         upcoming=[{**dict(row),**countdown(row["day"],row["yearly"])} for row in db().execute("SELECT * FROM anniversaries"+("" if g.account and not g.public_preview else " WHERE public=1"))]
         upcoming.sort(key=lambda item:(item["days"]<0,abs(item["days"])))
@@ -359,7 +416,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
                     cursor=db().execute("INSERT INTO moments(author_id,title,content,day,mood,public,photo,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
                                   (g.account["id"],title,content,day,mood,public,photo,stamp_now,stamp_now))
                     result_id=cursor.lastrowid
-            flash("这一天，已经好好留下了。" + (" 目前公开可见。" if public else " 仅你们两人可见。"))
+            flash("这一天已经保存，仅自己可见。")
             return redirect(url_for("detail",moment_id=result_id))
         return render_template("love_write.html",moment=row)
 
@@ -485,7 +542,11 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
                     db().execute('UPDATE todos SET title=?,notes=?,project=?,due=?,priority=?,assignee_id=?,updated_at=? WHERE id=?',(*values,item_id))
                 else:
                     db().execute('INSERT INTO todos(title,notes,project,due,priority,assignee_id,updated_at,author_id) VALUES(?,?,?,?,?,?,?,?)',(*values,g.account['id']))
-            return redirect(url_for('todos',**todo_view(request.args)))
+            flash('待办已更新。' if editing else '待办已添加。')
+            return redirect(url_for('index') if request.form.get('return_home')=='1' else url_for('todos',**todo_view(request.args)))
+        return render_todos(editing)
+
+    def render_todos(editing=None,form_error=None):
         state=todo_view(request.args);selected=state['filter'];project=state['project']
         clauses={'open':'t.done=0 AND archived=0','today':"t.done=0 AND archived=0 AND due<>'' AND due<=?",'done':'t.done=1 AND archived=0','archive':'archived=1'}
         where=clauses.get(selected,clauses['open']);params=[today().isoformat()] if selected=='today' else []
@@ -494,7 +555,7 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
         people=db().execute("SELECT id,username FROM accounts WHERE active=1 AND role='admin'").fetchall()
         projects=[r[0] for r in db().execute('SELECT DISTINCT project FROM todos ORDER BY project')]
         totals=db().execute("SELECT COALESCE(SUM(done=0 AND archived=0),0) AS open, COALESCE(SUM(done=0 AND archived=0 AND due<>'' AND due<=?),0) AS today, COALESCE(SUM(done=1 AND archived=0),0) AS done, COALESCE(SUM(archived=1),0) AS archive FROM todos"+(' WHERE project=?' if project else ''),[today().isoformat()]+([project] if project else [])).fetchone()
-        return render_template('love_todos.html',tasks=rows,editing=editing,people=people,projects=projects,selected=selected,project=project,totals=totals)
+        return render_template('love_todos.html',tasks=rows,editing=editing,people=people,projects=projects,selected=selected,project=project,totals=totals,form_error=form_error)
 
     @app.post('/todos/<int:item_id>/<action>')
     @member_only()
@@ -506,7 +567,8 @@ def create_app(data_dir=None, cookie_path="/", secure=None, testing=False):
         with db():
             if action=='toggle': db().execute('UPDATE todos SET done=1-done,updated_at=? WHERE id=?',(dt.datetime.now(dt.timezone.utc).isoformat(),item_id))
             else: db().execute('UPDATE todos SET archived=? WHERE id=?',(int(action=='archive'),item_id))
-        return redirect(url_for('todos',**todo_view(request.form)))
+        flash({'toggle':'待办已重新打开。' if row['done'] else '这件小事完成了。','archive':'待办已归档，可随时恢复。','restore':'待办已恢复。'}[action])
+        return redirect(url_for('index') if request.form.get('return_home')=='1' else url_for('todos',**todo_view(request.form)))
 
     @app.route("/settings",methods=["GET","POST"])
     @member_only(admin=True)

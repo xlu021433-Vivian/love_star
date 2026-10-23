@@ -1,0 +1,3 @@
+{% extends 'love_base.html' %}{% from '_love_icons.html' import icon %}
+{% block title %}本人登录 · 恋爱星{% endblock %}
+{% block main %}<section class="auth-card">{{ icon('heart','auth-icon') }}<h1>私人空间</h1><p>登录博客站主账号后，直接回到你的恋爱星。普通账号和访客不能访问这里。</p><a class="button primary" href="{{ host_login_url }}">使用站主账号进入 →</a><a class="text-link auth-home" href="/">先回 L5 主页</a></section>{% endblock %}

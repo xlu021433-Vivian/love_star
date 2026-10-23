@@ -13,4 +13,5 @@
   });
   document.addEventListener('keydown',event=>{if(event.key==='Escape')document.querySelectorAll('details[open]').forEach(node=>{node.open=false;node.querySelector('summary')?.focus();});});
   document.addEventListener('click',event=>{document.querySelectorAll('.account-menu[open]').forEach(node=>{if(!node.contains(event.target))node.open=false;});});
+  document.querySelector('.form-error')?.focus({preventScroll:true});
 })();
